@@ -1,0 +1,71 @@
+services:
+
+  macro-oracle:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ORACLE_PIPELINE_VERSION: "${ORACLE_PIPELINE_VERSION:-dev}"
+    image: clawofshiva/macro-oracle:latest
+    restart: unless-stopped
+
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+
+      # Provider API keys — set in .env on the VPS
+      FRED_API_KEY:          "${FRED_API_KEY}"
+      FMP_API_KEY:           "${FMP_API_KEY}"
+      ALPHAVANTAGE_API_KEY:  "${ALPHAVANTAGE_API_KEY}"
+      COINGECKO_API_KEY:     "${COINGECKO_API_KEY:-}"
+
+      # Admin / refresh token
+      ORACLE_REFRESH_TOKEN:  "${ORACLE_REFRESH_TOKEN:-change-me}"
+      CRON_ADMIN_BEARER:     "${CRON_ADMIN_BEARER:-change-me}"
+
+      # Persistence (file mode default; swap to postgres when DB is wired)
+      PERSISTENCE_MODE:      "${PERSISTENCE_MODE:-file}"
+      DATABASE_URL:          "${DATABASE_URL:-}"
+      DB_SCHEMA:             "${DB_SCHEMA:-radar}"
+
+      # Freshness thresholds
+      FRESHNESS_WARN_MINUTES_CRITICAL: "${FRESHNESS_WARN_MINUTES_CRITICAL:-120}"
+      FRESHNESS_PAGE_MINUTES_CRITICAL: "${FRESHNESS_PAGE_MINUTES_CRITICAL:-360}"
+      FRESHNESS_WARN_MINUTES_NORMAL:   "${FRESHNESS_WARN_MINUTES_NORMAL:-1440}"
+
+      # Alerting webhook (Discord / Slack)
+      ALERT_WEBHOOK_URL:     "${ALERT_WEBHOOK_URL:-}"
+
+    volumes:
+      # Persist cron state across container restarts
+      - cron_state:/app/cron/.state
+
+    expose:
+      - "3000"
+
+    labels:
+      - "traefik.enable=true"
+
+      # ── HTTP router (redirect to HTTPS) ───────────────────────────────────
+      - "traefik.http.routers.macro-oracle-http.rule=Host(`www.clawofshiva.ai`)"
+      - "traefik.http.routers.macro-oracle-http.entrypoints=web"
+      - "traefik.http.routers.macro-oracle-http.middlewares=https-redirect"
+
+      # ── HTTPS router ──────────────────────────────────────────────────────
+      - "traefik.http.routers.macro-oracle.rule=Host(`www.clawofshiva.ai`)"
+      - "traefik.http.routers.macro-oracle.entrypoints=websecure"
+      - "traefik.http.routers.macro-oracle.tls=true"
+      - "traefik.http.routers.macro-oracle.tls.certresolver=letsencrypt"
+
+      # ── Service ───────────────────────────────────────────────────────────
+      - "traefik.http.services.macro-oracle.loadbalancer.server.port=3000"
+
+    networks:
+      - traefik_proxy
+
+volumes:
+  cron_state:
+
+networks:
+  traefik_proxy:
+    external: true

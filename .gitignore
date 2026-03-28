@@ -1,0 +1,9 @@
+node_modules/
+.next/
+cron/.state/
+.cache/
+*.tar.gz
+*.log
+.env.local
+.env.development.local
+.env
