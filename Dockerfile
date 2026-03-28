@@ -16,7 +16,7 @@ COPY . .
 ARG ORACLE_PIPELINE_VERSION=docker
 ENV ORACLE_PIPELINE_VERSION=$ORACLE_PIPELINE_VERSION
 
-RUN npm run build
+RUN mkdir -p public && npm run build
 
 # ── Stage 3: runner ──────────────────────────────────────────────────────────
 FROM node:22-alpine AS runner
