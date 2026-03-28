@@ -47,12 +47,12 @@ services:
       - "traefik.enable=true"
 
       # ── HTTP router (redirect to HTTPS) ───────────────────────────────────
-      - "traefik.http.routers.macro-oracle-http.rule=Host(`www.clawofshiva.ai`)"
+      - "traefik.http.routers.macro-oracle-http.rule=Host(`www.clawofshiva.tech`)"
       - "traefik.http.routers.macro-oracle-http.entrypoints=web"
       - "traefik.http.routers.macro-oracle-http.middlewares=https-redirect"
 
       # ── HTTPS router ──────────────────────────────────────────────────────
-      - "traefik.http.routers.macro-oracle.rule=Host(`www.clawofshiva.ai`)"
+      - "traefik.http.routers.macro-oracle.rule=Host(`www.clawofshiva.tech`)"
       - "traefik.http.routers.macro-oracle.entrypoints=websecure"
       - "traefik.http.routers.macro-oracle.tls=true"
       - "traefik.http.routers.macro-oracle.tls.certresolver=acme"
