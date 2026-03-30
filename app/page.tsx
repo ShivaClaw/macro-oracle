@@ -1,287 +1,259 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import MacroOracleRadar, { type MacroOracleRadarPayload, type MacroOracleMode } from '../components/MacroOracleRadar';
+import { useRef, useState } from 'react';
+import Link from 'next/link';
 
-// ── Mock payloads ──────────────────────────────────────────────────────────
+const PROJECTS = [
+  {
+    id: 'hierarchical-memory',
+    label: 'OpenClaw skill: hierarchical-memory-storage',
+    href: 'https://clawhub.ai/shivaclaw/hierarchical-memory-storage',
+    external: true,
+  },
+  {
+    id: 'global-oracle',
+    label: 'Global Macroeconomic Oracle',
+    href: '/oracle?mode=g',
+    external: false,
+  },
+  {
+    id: 'portfolio-risk',
+    label: 'Portfolio Risk Manager',
+    href: '/oracle?mode=p',
+    external: false,
+  },
+  {
+    id: 'susy',
+    label: 'Searching for SUSY',
+    href: 'https://gemini.google.com/share/2d35b47a1fc5',
+    external: true,
+  },
+] as const;
 
-const MOCK_G: MacroOracleRadarPayload = {
-  asOf: new Date().toISOString(),
-  mode: 'g',
-  bands: [
-    { key: 'R1', label: 'RISK 1', name: 'Cash Equiv.',  valueNow: 22.1, value7dAgo: 20.4, flowDirection: 'inflow'  },
-    { key: 'R3', label: 'RISK 3', name: 'Core Equity',  valueNow: 18.6, value7dAgo: 19.8, flowDirection: 'outflow' },
-    { key: 'R5', label: 'RISK 5', name: 'Commodities',  valueNow: 12.4, value7dAgo: 11.9, flowDirection: 'inflow'  },
-    { key: 'R6', label: 'RISK 6', name: 'Risk ON',      valueNow:  9.2, value7dAgo: 11.5, flowDirection: 'outflow' },
-    { key: 'R4', label: 'RISK 4', name: 'Hard Assets',  valueNow: 16.8, value7dAgo: 16.6, flowDirection: 'neutral' },
-    { key: 'R2', label: 'RISK 2', name: 'Low Risk',     valueNow:  8.3, value7dAgo:  7.1, flowDirection: 'inflow'  },
-  ],
-  meta: { source: 'mock' }
-};
+export default function HomePage() {
+  const [open, setOpen] = useState(false);
+  const dropRef = useRef<HTMLDivElement>(null);
 
-const MOCK_P: MacroOracleRadarPayload = {
-  asOf: new Date().toISOString(),
-  mode: 'p',
-  bands: [
-    { key: 'R1', label: 'RISK 1', name: 'Cash Equiv.',  valueNow: 12.0, value7dAgo: 15.0 },
-    { key: 'R3', label: 'RISK 3', name: 'Core Equity',  valueNow: 10.5, value7dAgo:  9.2 },
-    { key: 'R5', label: 'RISK 5', name: 'Commodities',  valueNow:  8.0, value7dAgo:  7.5 },
-    { key: 'R7', label: 'RISK 7', name: 'Venture',      valueNow:  5.5, value7dAgo:  5.5 },
-    { key: 'R8', label: 'RISK 8', name: 'Trading',      valueNow: 18.0, value7dAgo: 14.0 },
-    { key: 'R6', label: 'RISK 6', name: 'Risk ON',      valueNow: 22.0, value7dAgo: 19.0 },
-    { key: 'R4', label: 'RISK 4', name: 'Hard Assets',  valueNow: 14.0, value7dAgo: 15.8 },
-    { key: 'R2', label: 'RISK 2', name: 'Low Risk',     valueNow: 10.0, value7dAgo:  9.0 },
-  ],
-  meta: { source: 'mock' }
-};
-
-// ── API fetch ──────────────────────────────────────────────────────────────
-
-async function fetchRadarPayload(mode: MacroOracleMode, signal?: AbortSignal): Promise<MacroOracleRadarPayload> {
-  const res = await fetch(`/api/oracle-data/radar?mode=${mode}`, {
-    method: 'GET',
-    headers: { accept: 'application/json' },
-    cache: 'no-store',
-    signal
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json() as MacroOracleRadarPayload;
-  if (!data.asOf || !Array.isArray(data.bands) || !data.bands.length) {
-    throw new Error('Invalid payload shape from /api/oracle-data/radar');
+  function handleBlur() {
+    // Short delay so click inside registers before close
+    setTimeout(() => setOpen(false), 120);
   }
-  return data;
-}
-
-// ── Status badge ───────────────────────────────────────────────────────────
-
-type DataStatus = 'loading' | 'live' | 'mock' | 'error';
-
-function StatusBadge({ status, error }: { status: DataStatus; error?: string | null }) {
-  const color = status === 'live' ? '#22c55e' : status === 'loading' ? '#facc15' : '#f87171';
-  const label = status === 'loading' ? 'fetching\u2026' : status;
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-      <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, display: 'inline-block' }} />
-      <span style={{ color: 'var(--muted)', fontSize: 12 }}>{label}</span>
-      {status === 'error' && error && (
-        <span style={{ color: 'rgba(255,255,255,0.4)', fontSize: 11, marginLeft: 4 }}>({error})</span>
-      )}
-    </span>
-  );
-}
-
-// ── Band table ─────────────────────────────────────────────────────────────
-
-function BandRow({ band }: { band: MacroOracleRadarPayload['bands'][number] }) {
-  const delta = band.delta7d ?? (band.value7dAgo != null ? band.valueNow - band.value7dAgo : null);
-  const deltaColor = delta == null ? 'var(--muted)' : delta > 0 ? '#fb923c' : delta < 0 ? '#60a5fa' : 'var(--muted)';
-  return (
-    <tr>
-      <td style={{ color: 'var(--muted)', paddingRight: 10, fontSize: 11, whiteSpace: 'nowrap' }}>{band.key}</td>
-      <td style={{ paddingRight: 16, fontSize: 12 }}>{band.name ?? band.label}</td>
-      <td style={{ textAlign: 'right', fontVariantNumeric: 'tabular-nums', paddingRight: 12 }}>
-        {band.valueNow.toFixed(1)}
-      </td>
-      <td style={{ textAlign: 'right', color: deltaColor, fontVariantNumeric: 'tabular-nums', fontSize: 12 }}>
-        {delta != null ? `${delta > 0 ? '+' : ''}${delta.toFixed(1)}` : '\u2014'}
-      </td>
-    </tr>
-  );
-}
-
-// ── Page ───────────────────────────────────────────────────────────────────
-
-export default function Page() {
-  const [mode, setMode] = useState<MacroOracleMode>('g');
-  const [payload, setPayload] = useState<MacroOracleRadarPayload>(MOCK_G);
-  const [status, setStatus] = useState<DataStatus>('loading');
-  const [error, setError] = useState<string | null>(null);
-  const [refreshedAt, setRefreshedAt] = useState<Date | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
-
-  const load = useCallback((currentMode: MacroOracleMode) => {
-    abortRef.current?.abort();
-    const ac = new AbortController();
-    abortRef.current = ac;
-    setStatus('loading');
-    setError(null);
-    fetchRadarPayload(currentMode, ac.signal)
-      .then((p) => {
-        setPayload(p);
-        setStatus('live');
-        setRefreshedAt(new Date());
-      })
-      .catch((e: unknown) => {
-        if ((e as Error)?.name === 'AbortError') return;
-        setPayload(currentMode === 'g' ? MOCK_G : MOCK_P);
-        setStatus('error');
-        setError(String((e as Error)?.message ?? e));
-      });
-  }, []);
-
-  useEffect(() => {
-    load(mode);
-    return () => abortRef.current?.abort();
-  }, [load, mode]);
-
-  useEffect(() => {
-    const id = setInterval(() => load(mode), 5 * 60 * 1000);
-    return () => clearInterval(id);
-  }, [load, mode]);
-
-  const asOfLocal = useMemo(() => {
-    const d = new Date(payload.asOf);
-    return Number.isNaN(d.getTime()) ? payload.asOf : d.toLocaleString();
-  }, [payload.asOf]);
-
-  const refreshedAtStr = useMemo(() => refreshedAt ? refreshedAt.toLocaleTimeString() : null, [refreshedAt]);
-  const cacheHit = payload.meta?.cacheHit;
-  const cacheAge = typeof payload.meta?.cacheAgeSeconds === 'number' ? `${payload.meta.cacheAgeSeconds}s` : null;
-  const axisCount = mode === 'g' ? 6 : 8;
 
   return (
-    <main className="page">
-      <header className="header">
-        <div className="title">Macro Oracle Radar</div>
-        <div className="subtitle">
-          Allocation shape \u00b7 per-band intensity \u00b7 7d momentum tails.
-        </div>
+    <main className="home-page">
+      {/* ── splash ─────────────────────────────────────────────────────── */}
+      <div className="splash-wrap">
+        <img
+          src="/splash.png"
+          alt="Portable G and Claw of Shiva — Om and Jolly Roger sigil"
+          className="splash-img"
+        />
+        <div className="splash-overlay" />
+      </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10 }}>
-          <span style={{ fontSize: 11, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>View</span>
-          <div style={{
-            display: 'flex',
-            background: 'rgba(255,255,255,0.06)',
-            border: '1px solid rgba(255,255,255,0.12)',
-            borderRadius: 8,
-            padding: 2,
-            gap: 2
-          }}>
-            {(['g', 'p'] as const).map((m) => (
-              <button
-                key={m}
-                onClick={() => setMode(m)}
-                style={{
-                  background: mode === m ? 'rgba(255,255,255,0.15)' : 'transparent',
-                  border: 'none',
-                  color: mode === m ? 'var(--fg1)' : 'var(--muted)',
-                  borderRadius: 6,
-                  padding: '4px 14px',
-                  fontSize: 12,
-                  fontWeight: mode === m ? 600 : 400,
-                  cursor: 'pointer',
-                  letterSpacing: '0.04em',
-                  transition: 'all 0.15s ease'
-                }}
-              >
-                {m === 'g' ? '\ud83c\udf10 Global' : '\ud83d\udc64 Personal'}
-              </button>
-            ))}
-          </div>
-          <span style={{ fontSize: 11, color: 'var(--muted)' }}>
-            {mode === 'g' ? 'Global M2 allocation map' : 'Personal portfolio allocation'}
-          </span>
-        </div>
-      </header>
+      {/* ── content ────────────────────────────────────────────────────── */}
+      <section className="home-content">
+        <h1 className="home-title">Portable G and Claw of Shiva</h1>
+        <p className="home-sub">
+          First-principles tools for understanding capital, risk, and reality.
+        </p>
 
-      <section className="panel radar-row">
-        <div style={{ flex: '0 0 auto' }}>
-          <MacroOracleRadar payload={payload} mode={mode} theme="dark" size="lg" showBadges />
-        </div>
-
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16, minWidth: 220 }}>
-          <div className="kv" style={{ fontSize: 13 }}>
-            <div style={{ color: 'var(--muted)' }}>data</div>
-            <div><StatusBadge status={status} error={error} /></div>
-
-            <div style={{ color: 'var(--muted)' }}>mode</div>
-            <div style={{ fontSize: 12 }}>{mode === 'g' ? 'Global (G)' : 'Personal (P)'}</div>
-
-            <div style={{ color: 'var(--muted)' }}>as-of</div>
-            <div style={{ fontSize: 12 }}>{asOfLocal}</div>
-
-            {refreshedAtStr && (
-              <>
-                <div style={{ color: 'var(--muted)' }}>fetched</div>
-                <div style={{ fontSize: 12 }}>{refreshedAtStr}</div>
-              </>
-            )}
-            {cacheAge && (
-              <>
-                <div style={{ color: 'var(--muted)' }}>cache</div>
-                <div style={{ fontSize: 12 }}>{cacheHit ? `hit \u00b7 ${cacheAge} old` : 'miss'}</div>
-              </>
-            )}
-            <div style={{ color: 'var(--muted)' }}>axes</div>
-            <div>{axisCount}</div>
-          </div>
-
-          <div>
-            <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-              Band Scores
-            </div>
-            <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 13 }}>
-              <thead>
-                <tr style={{ color: 'var(--muted)', fontSize: 11 }}>
-                  <th style={{ textAlign: 'left', paddingRight: 10, fontWeight: 400 }}>ID</th>
-                  <th style={{ textAlign: 'left', paddingRight: 16, fontWeight: 400 }}>Band</th>
-                  <th style={{ textAlign: 'right', paddingRight: 12, fontWeight: 400 }}>Now</th>
-                  <th style={{ textAlign: 'right', fontWeight: 400 }}>7d \u0394</th>
-                </tr>
-              </thead>
-              <tbody>
-                {payload.bands.map((b) => <BandRow key={b.key} band={b} />)}
-              </tbody>
-            </table>
-          </div>
-
-          <div className="note">
-            {mode === 'g' ? (
-              <>
-                <b>G-mode: Global M2 map</b>
-                <br />\u00b7 Shape \u2014 global capital distribution
-                <br />\u00b7 Wedges \u2014 per-sector intensity
-                <br />\u00b7 <span style={{ color: '#1FE091' }}>Green</span> \u2014 7d net inflow
-                <br />\u00b7 <span style={{ color: '#FF5E5B' }}>Red</span> \u2014 7d net outflow
-                <br />\u00b7 <span style={{ color: '#6F738A' }}>Grey</span> \u2014 neutral
-              </>
-            ) : (
-              <>
-                <b>P-mode: Personal portfolio</b>
-                <br />\u00b7 Shape \u2014 allocation distribution
-                <br />\u00b7 Wedges \u2014 per-band intensity
-                <br />\u00b7 <span style={{ color: '#fb923c' }}>Warm tails</span> \u2014 7d outward (risk-on)
-                <br />\u00b7 <span style={{ color: '#60a5fa' }}>Cool tails</span> \u2014 7d inward (risk-off)
-              </>
-            )}
-          </div>
-
+        {/* dropdown */}
+        <div className="dropdown-wrap" ref={dropRef} onBlur={handleBlur}>
           <button
-            onClick={() => load(mode)}
-            disabled={status === 'loading'}
-            style={{
-              background: 'rgba(255,255,255,0.06)',
-              border: '1px solid rgba(255,255,255,0.12)',
-              color: 'var(--fg1)',
-              borderRadius: 6,
-              padding: '6px 14px',
-              fontSize: 12,
-              cursor: status === 'loading' ? 'not-allowed' : 'pointer',
-              opacity: status === 'loading' ? 0.5 : 1
-            }}
+            className="dropdown-trigger"
+            onClick={() => setOpen((v) => !v)}
+            aria-haspopup="listbox"
+            aria-expanded={open}
           >
-            {status === 'loading' ? 'Loading\u2026' : '\u21ba Refresh'}
+            <span>Active Projects</span>
+            <span className="dropdown-chevron" aria-hidden>
+              {open ? '▲' : '▼'}
+            </span>
           </button>
+
+          {open && (
+            <ul className="dropdown-menu" role="listbox">
+              {PROJECTS.map((p) =>
+                p.external ? (
+                  <li key={p.id} role="option">
+                    <a
+                      href={p.href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="dropdown-item"
+                    >
+                      {p.label}
+                      <span className="ext-icon" aria-hidden>↗</span>
+                    </a>
+                  </li>
+                ) : (
+                  <li key={p.id} role="option">
+                    <Link href={p.href} className="dropdown-item" onClick={() => setOpen(false)}>
+                      {p.label}
+                    </Link>
+                  </li>
+                )
+              )}
+            </ul>
+          )}
         </div>
       </section>
 
-      <section className="panel" style={{ fontSize: 12, color: 'var(--muted)', marginTop: 12 }}>
-        <code>GET /api/oracle-data/radar?mode=g|p</code> \u2192 <code>MacroOracleRadarPayload</code>
-        {' \u00b7 '}
-        <code>GET /api/oracle-data</code> \u2192 raw <code>OracleSnapshot</code>
-        {' \u00b7 '}
-        <code>GET /api/oracle-data/health</code> \u00b7 <code>GET /api/oracle-data/providers</code>
-      </section>
+      <style>{`
+        .home-page {
+          position: relative;
+          min-height: 100dvh;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          overflow: hidden;
+        }
+
+        .splash-wrap {
+          position: fixed;
+          inset: 0;
+          z-index: 0;
+        }
+
+        .splash-img {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+          object-position: center 30%;
+          display: block;
+        }
+
+        .splash-overlay {
+          position: absolute;
+          inset: 0;
+          background: linear-gradient(
+            to bottom,
+            rgba(7, 10, 18, 0.50) 0%,
+            rgba(7, 10, 18, 0.72) 40%,
+            rgba(7, 10, 18, 0.88) 100%
+          );
+        }
+
+        .home-content {
+          position: relative;
+          z-index: 1;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 18px;
+          padding: 32px 24px 48px;
+          text-align: center;
+          max-width: 600px;
+          width: 100%;
+        }
+
+        .home-title {
+          margin: 0;
+          font-size: clamp(26px, 5vw, 46px);
+          font-weight: 700;
+          letter-spacing: -0.02em;
+          line-height: 1.15;
+          background: linear-gradient(135deg, #fff 30%, #c8a96e 70%, #6ee7e7 100%);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
+          text-fill-color: transparent;
+        }
+
+        .home-sub {
+          margin: 0;
+          font-size: 14px;
+          color: rgba(255,255,255,0.55);
+          line-height: 1.6;
+          max-width: 440px;
+        }
+
+        .dropdown-wrap {
+          position: relative;
+          width: 100%;
+          max-width: 380px;
+        }
+
+        .dropdown-trigger {
+          width: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.18);
+          color: rgba(255,255,255,0.92);
+          border-radius: 10px;
+          padding: 12px 18px;
+          font-size: 14px;
+          font-weight: 600;
+          letter-spacing: 0.03em;
+          cursor: pointer;
+          transition: background 0.15s, border-color 0.15s;
+          backdrop-filter: blur(8px);
+          -webkit-backdrop-filter: blur(8px);
+        }
+
+        .dropdown-trigger:hover {
+          background: rgba(255,255,255,0.13);
+          border-color: rgba(255,255,255,0.28);
+        }
+
+        .dropdown-chevron {
+          font-size: 10px;
+          opacity: 0.6;
+        }
+
+        .dropdown-menu {
+          position: absolute;
+          top: calc(100% + 6px);
+          left: 0;
+          right: 0;
+          list-style: none;
+          margin: 0;
+          padding: 6px;
+          background: rgba(11, 16, 32, 0.96);
+          border: 1px solid rgba(255,255,255,0.14);
+          border-radius: 12px;
+          backdrop-filter: blur(16px);
+          -webkit-backdrop-filter: blur(16px);
+          box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+          z-index: 100;
+          animation: dd-in 0.12s ease;
+        }
+
+        @keyframes dd-in {
+          from { opacity: 0; transform: translateY(-4px); }
+          to   { opacity: 1; transform: translateY(0); }
+        }
+
+        .dropdown-item {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          width: 100%;
+          padding: 10px 14px;
+          border-radius: 8px;
+          font-size: 13px;
+          color: rgba(255,255,255,0.80);
+          text-decoration: none;
+          transition: background 0.1s, color 0.1s;
+          cursor: pointer;
+        }
+
+        .dropdown-item:hover {
+          background: rgba(255,255,255,0.10);
+          color: rgba(255,255,255,0.96);
+        }
+
+        .ext-icon {
+          font-size: 11px;
+          opacity: 0.45;
+          flex-shrink: 0;
+        }
+      `}</style>
     </main>
   );
 }
