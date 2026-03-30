@@ -1,19 +1,19 @@
 export type FlowDirection = 'inflow' | 'outflow' | 'neutral';
 
+export type MacroOracleMode = 'g' | 'p';
+
 export type RiskBandPoint = {
-  key: string;
-  label: string;
-  name?: string;
-  valueNow: number;
-  value7dAgo?: number;
-  delta7d?: number;
+  key: string; // 'R0'...'R8'
+  label: string; // 'RISK 0'
+  name?: string; // 'Cash / T-Bills'
+  valueNow: number; // 0..100
+  value7dAgo?: number; // 0..100
+  delta7d?: number; // optional
   flowDirection?: FlowDirection;
 };
 
-export type MacroOracleMode = 'g' | 'p';
-
 export type MacroOracleRadarPayload = {
-  asOf: string;
+  asOf: string; // ISO
   mode?: MacroOracleMode;
   bands: RiskBandPoint[];
   history?: {

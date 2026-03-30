@@ -3,18 +3,15 @@
  *
  * Returns a MacroOracleRadarPayload ready for the frontend chart component.
  *
- * Differences from GET /api/oracle-data (raw OracleSnapshot):
- *  - RISK_N → RN key mapping
- *  - band.score → valueNow (0–100)
- *  - 7-day-ago axis scores from the cron persistence layer → value7dAgo + delta7d
- *  - Optional 30-day history series for sparklines / trend context
- *
  * Query params:
- *  - ?mode=g|p              Mode selector (g = Global/G-mode, p = Pipeline/P-mode [default])
- *  - ?history=true|1        Include N-day daily history points (default off)
- *  - ?historyDays=N         Override history lookback in days (default 30, max 90)
- *  - ?asOf=YYYY-MM-DD       Serve from a persisted snapshot file (debug/backtesting)
- *  - ?bands=RISK_0,RISK_1   Filter to specific bands (P-mode only)
+ *  - ?mode=g|p
+ *      - g: Global "G-mode" radar (macro buckets)
+ *      - p: Personal "P-mode" radar (on-chain portfolio)
+ *      - (unset/other): legacy pipeline snapshot radar
+ *  - ?history=true|1        Include N-day daily history points (default off; legacy only)
+ *  - ?historyDays=N         Override history lookback in days (default 30, max 90; legacy only)
+ *  - ?asOf=YYYY-MM-DD       Serve from a persisted snapshot file (debug/backtesting; legacy only)
+ *  - ?bands=RISK_0,RISK_1   Filter to specific bands (legacy only)
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -24,6 +21,7 @@ import { getSevenDayAgoScores, getAxisHistory } from '@/lib/oracle/axisStore'
 import type { RiskBandId } from '@/lib/config/types'
 import { RISK_BANDS } from '@/lib/config/riskBands'
 import { getGModeRadarPayload } from '@/lib/providers/gmode'
+import { getPmodeRadarPayload } from '@/lib/providers/pmode'
 
 export const runtime = 'nodejs'
 
@@ -51,17 +49,23 @@ function clampInt(v: number, lo: number, hi: number): number {
 
 export async function GET(req: NextRequest) {
   const url = new URL(req.url)
-  const mode = (url.searchParams.get('mode') ?? 'p').toLowerCase()
+  const modeParam = (url.searchParams.get('mode') ?? '').toLowerCase()
 
-  // ── G-mode (Global) ─────────────────────────────────────────────────────
-  if (mode === 'g') {
+  if (modeParam === 'g') {
     const payload = await getGModeRadarPayload()
     const res = NextResponse.json(payload)
     res.headers.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=600')
     return res
   }
 
-  // ── P-mode (Pipeline) [default] ─────────────────────────────────────────
+  if (modeParam === 'p') {
+    const payload = await getPmodeRadarPayload()
+    const res = NextResponse.json(payload)
+    res.headers.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=600')
+    return res
+  }
+
+  // ── Legacy pipeline radar (default when mode unset) ─────────────────────
   const includeHistory = parseBool(url.searchParams.get('history'))
   const historyDays = clampInt(
     Number(url.searchParams.get('historyDays') ?? DEFAULT_HISTORY_DAYS),
@@ -83,7 +87,7 @@ export async function GET(req: NextRequest) {
     // Cron data not yet available; tails will be omitted
   }
 
-  // ── 3. Optional history ───────────────────────────────────────────────────
+  // ── 3. Optional history ─────────────────────────────────────────────────
   let historyPoints: Array<{ ts: string; scores: Partial<Record<RiskBandId, number>> }> | undefined
   if (includeHistory) {
     try {
@@ -97,7 +101,7 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  // ── 4. Transform → radar payload ──────────────────────────────────────────
+  // ── 4. Transform → radar payload ───────────────────────────────────────
   const radarPayload = snapshotToRadarPayload(snapshot, sevenDayAgo, historyPoints)
 
   const res = NextResponse.json(radarPayload)
