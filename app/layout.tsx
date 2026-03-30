@@ -2,8 +2,8 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Macro Oracle Radar',
-  description: 'Non-interactive radar for allocation + momentum across risk bands.'
+  title: 'Portable G and Claw of Shiva',
+  description: 'First-principles tools for understanding capital, risk, and reality — by Portable G and Shiva.'
 };
 
 export default function RootLayout({
