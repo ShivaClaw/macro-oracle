@@ -11,14 +11,18 @@ export type BuildOptionParams = {
   showGhostPrev?: boolean;
 };
 
+/**
+ * Return the axis vertex label for a band.
+ * Prefers band.name (semantic label) over band.label (the R-number code).
+ * The goal is a clean polygon with no alphanumeric identifiers cluttering
+ * the vertices — just human-readable category names.
+ */
 function axisLabelForBand(
   band: { label: string; name?: string },
-  labelMode: RadarLabelMode
+  _labelMode: RadarLabelMode
 ): string {
-  const primary = band.label;
-  const secondary = band.name ?? '';
-  if (labelMode === 'compact' || !secondary) return primary;
-  return `${primary}\n${secondary}`.trim();
+  // Use semantic name when available; fall back to raw label only as last resort
+  return band.name || band.label;
 }
 
 export function buildRadarOption(
@@ -39,7 +43,6 @@ export function buildRadarOption(
   const seriesData: any[] = [];
 
   if (showGhostPrev) {
-    // If backend supplies value7dAgo consistently, ghost polygon helps.
     const hasAllPrev = payload.bands.every((b) => typeof b.value7dAgo === 'number');
     if (hasAllPrev) {
       const vPrev = payload.bands.map((b) => clamp(b.value7dAgo ?? b.valueNow, 0, 100));
