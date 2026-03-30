@@ -10,10 +10,11 @@
  *  - Optional 30-day history series for sparklines / trend context
  *
  * Query params:
+ *  - ?mode=g|p              Mode selector (g = Global/G-mode, p = Pipeline/P-mode [default])
  *  - ?history=true|1        Include N-day daily history points (default off)
  *  - ?historyDays=N         Override history lookback in days (default 30, max 90)
  *  - ?asOf=YYYY-MM-DD       Serve from a persisted snapshot file (debug/backtesting)
- *  - ?bands=RISK_0,RISK_1   Filter to specific bands
+ *  - ?bands=RISK_0,RISK_1   Filter to specific bands (P-mode only)
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -22,6 +23,7 @@ import { snapshotToRadarPayload } from '@/lib/pipeline/radarTransform'
 import { getSevenDayAgoScores, getAxisHistory } from '@/lib/oracle/axisStore'
 import type { RiskBandId } from '@/lib/config/types'
 import { RISK_BANDS } from '@/lib/config/riskBands'
+import { getGModeRadarPayload } from '@/lib/providers/gmode'
 
 export const runtime = 'nodejs'
 
@@ -49,6 +51,17 @@ function clampInt(v: number, lo: number, hi: number): number {
 
 export async function GET(req: NextRequest) {
   const url = new URL(req.url)
+  const mode = (url.searchParams.get('mode') ?? 'p').toLowerCase()
+
+  // ── G-mode (Global) ─────────────────────────────────────────────────────
+  if (mode === 'g') {
+    const payload = await getGModeRadarPayload()
+    const res = NextResponse.json(payload)
+    res.headers.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=600')
+    return res
+  }
+
+  // ── P-mode (Pipeline) [default] ─────────────────────────────────────────
   const includeHistory = parseBool(url.searchParams.get('history'))
   const historyDays = clampInt(
     Number(url.searchParams.get('historyDays') ?? DEFAULT_HISTORY_DAYS),
