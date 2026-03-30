@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import * as echarts from 'echarts';
 import type { EChartsType } from 'echarts';
 
-import type { MacroOracleRadarPayload, MacroOracleRadarProps, RiskBandPoint } from './types';
+import type { MacroOracleRadarPayload, MacroOracleRadarProps, RiskBandPoint, MacroOracleMode } from './types';
 import { buildRadarOption, type RadarLabelMode } from './option';
 import { buildGraphicOverlays } from './overlays';
 import { computeRadarMetrics } from './metrics';
@@ -15,7 +15,8 @@ const ReactECharts = dynamic(() => import('echarts-for-react').then((m) => m.def
   ssr: false
 });
 
-const PREFERRED_AXIS_SEQUENCE = ['R1', 'R3', 'R5', 'R7', 'R8', 'R6', 'R4', 'R2'];
+const G_AXIS_SEQUENCE = ['R1', 'R3', 'R5', 'R6', 'R4', 'R2'];
+const P_AXIS_SEQUENCE = ['R1', 'R3', 'R5', 'R7', 'R8', 'R6', 'R4', 'R2'];
 
 type Dims = { w: number; h: number };
 
@@ -31,10 +32,11 @@ function canonicalBandKey(band: RiskBandPoint): string | null {
   return null;
 }
 
-function reorderBands(payload: MacroOracleRadarPayload): MacroOracleRadarPayload {
+function reorderBands(payload: MacroOracleRadarPayload, mode: MacroOracleMode): MacroOracleRadarPayload {
+  const seq = mode === 'g' ? G_AXIS_SEQUENCE : P_AXIS_SEQUENCE;
   const decorated = payload.bands.map((band, originalIndex) => {
     const canonical = canonicalBandKey(band);
-    const seqIndex = canonical ? PREFERRED_AXIS_SEQUENCE.indexOf(canonical) : -1;
+    const seqIndex = canonical ? seq.indexOf(canonical) : -1;
     return { band, canonical, seqIndex, originalIndex };
   });
 
@@ -44,23 +46,18 @@ function reorderBands(payload: MacroOracleRadarPayload): MacroOracleRadarPayload
     .map((d) => d.band);
 
   if (prioritized.length) {
-    return {
-      ...payload,
-      bands: prioritized
-    };
+    return { ...payload, bands: prioritized };
   }
-
   return payload;
 }
 
 function sizeToMinPx(size: MacroOracleRadarProps['size']): number {
   if (size === 'sm') return 260;
   if (size === 'md') return 330;
-  return 420; // lg default
+  return 420;
 }
 
 function deriveRadius(dims: Dims, size: MacroOracleRadarProps['size']): string {
-  // Per spec: 70% desktop, 62% mobile.
   const mobile = dims.w < 420;
   if (size === 'sm') return mobile ? '58%' : '62%';
   if (size === 'md') return mobile ? '60%' : '66%';
@@ -72,7 +69,6 @@ function deriveLabelMode(dims: Dims): RadarLabelMode {
 }
 
 function resolveRadarGeometry(chart: EChartsType, n: number, radius: string | number): RadarGeometry {
-  // Prefer the coordinate system computed by ECharts (accounts for layout).
   try {
     const model: any = (chart as any).getModel?.();
     const radarComp: any = model?.getComponent?.('radar', 0);
@@ -87,23 +83,22 @@ function resolveRadarGeometry(chart: EChartsType, n: number, radius: string | nu
       };
     }
   } catch {
-    // fall through to manual approximation
+    // fall through
   }
 
   const w = chart.getWidth();
   const h = chart.getHeight();
-
   const cx = parsePercent('50%', w);
   const cy = parsePercent('52%', h);
   const basis = Math.min(w, h) / 2;
   const r = parsePercent(radius, basis);
-
   return { cx, cy, r, startAngleDeg: 90, n };
 }
 
 export default function MacroOracleRadar(props: MacroOracleRadarProps) {
-  const { payload, theme, size = 'md', showBadges = true } = props;
-  const orderedPayload = useMemo(() => reorderBands(payload), [payload]);
+  const { payload, mode: modeProp, theme, size = 'md', showBadges = true } = props;
+  const effectiveMode: MacroOracleMode = modeProp ?? payload.mode ?? 'p';
+  const orderedPayload = useMemo(() => reorderBands(payload, effectiveMode), [payload, effectiveMode]);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<EChartsType | null>(null);
@@ -111,7 +106,6 @@ export default function MacroOracleRadar(props: MacroOracleRadarProps) {
 
   useEffect(() => {
     if (!containerRef.current) return;
-
     const el = containerRef.current;
     const ro = new ResizeObserver((entries) => {
       const cr = entries[0]?.contentRect;
@@ -132,12 +126,7 @@ export default function MacroOracleRadar(props: MacroOracleRadarProps) {
       labelMode,
       showGhostPrev: true
     });
-
-    // Keep graphic component in the option so later merges don't drop it.
-    return {
-      ...base,
-      graphic: { elements: [] }
-    };
+    return { ...base, graphic: { elements: [] } };
   }, [orderedPayload, theme, radius, labelMode]);
 
   const metrics = useMemo(() => computeRadarMetrics(orderedPayload), [orderedPayload]);
@@ -145,8 +134,6 @@ export default function MacroOracleRadar(props: MacroOracleRadarProps) {
   const accessibilitySummary = useMemo(() => {
     const parts: string[] = [];
     if (metrics.labels.length) parts.push(metrics.labels.join(', '));
-
-    // Directional hint: compare low-risk share now vs 7d ago when available.
     parts.push(`Balance ${metrics.balance.toFixed(0)}`);
     parts.push(`Concentration ${metrics.concentration.toFixed(0)}`);
     parts.push(`Risk-off tilt ${metrics.riskOffTilt.toFixed(0)}`);
@@ -156,23 +143,13 @@ export default function MacroOracleRadar(props: MacroOracleRadarProps) {
   function updateOverlays() {
     const chart = chartRef.current;
     if (!chart) return;
-
     const n = orderedPayload.bands.length;
     if (n <= 0) return;
-
     const geom = resolveRadarGeometry(chart, n, radius);
-    const elements = buildGraphicOverlays({ echarts, payload: orderedPayload, geom, theme });
-
+    const elements = buildGraphicOverlays({ echarts, payload: orderedPayload, geom, theme, mode: effectiveMode });
     chart.setOption(
-      {
-        graphic: {
-          elements
-        }
-      },
-      {
-        lazyUpdate: true,
-        replaceMerge: ['graphic']
-      } as any
+      { graphic: { elements } },
+      { lazyUpdate: true, replaceMerge: ['graphic'] } as any
     );
   }
 
