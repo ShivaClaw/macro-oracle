@@ -8,6 +8,14 @@
  *
  * Optional:
  *  - COINGECKO_API_KEY (CoinGecko Pro; free tier works without)
+ *
+ * Band → sector mapping:
+ *  R1 = $ (Cash / Money Market)
+ *  R2 = Low Risk  (DeFi TVL)
+ *  R3 = Core Equity
+ *  R4 = Risk OFF  (BTC + Gold)
+ *  R5 = Vital Commodities
+ *  R6 = Risk ON   (altcoin market cap)
  */
 
 import type {
@@ -20,9 +28,11 @@ type BucketKey = 'R1' | 'R2' | 'R3' | 'R4' | 'R5' | 'R6'
 
 type BucketRaw = {
   key: BucketKey
+  /** Human-readable name shown on radar vertex and in table */
   name: string
   valueNowUsd: number
   value7dAgoUsd: number
+  valueYtdAgoUsd: number
   sources: string[]
   warnings?: string[]
 }
@@ -33,7 +43,6 @@ let cache:
   | {
       fetchedAt: number
       data: MacroOracleRadarPayload
-      // keep raw USD values for easier debugging / partial fallback
       raw: Record<BucketKey, BucketRaw>
     }
   | undefined
@@ -55,17 +64,19 @@ function flowDirection(now: number, prev: number): FlowDirection {
 }
 
 function toPercents(buckets: BucketRaw[]): RiskBandPoint[] {
-  const total = buckets.reduce((acc, b) => acc + (Number.isFinite(b.valueNowUsd) ? b.valueNowUsd : 0), 0)
+  const total = buckets.reduce(
+    (acc, b) => acc + (Number.isFinite(b.valueNowUsd) ? b.valueNowUsd : 0),
+    0
+  )
   const totalPrev = buckets.reduce(
     (acc, b) => acc + (Number.isFinite(b.value7dAgoUsd) ? b.value7dAgoUsd : 0),
     0
   )
 
-  // Avoid division by zero; in worst-case, return equal weights.
   const denom = total > 0 ? total : buckets.length
   const denomPrev = totalPrev > 0 ? totalPrev : buckets.length
 
-  const points = buckets.map((b) => {
+  return buckets.map((b) => {
     const valueNow = Number(((b.valueNowUsd / denom) * 100).toFixed(2))
     const value7dAgo = Number(((b.value7dAgoUsd / denomPrev) * 100).toFixed(2))
     const delta7d = Number((valueNow - value7dAgo).toFixed(2))
@@ -80,26 +91,23 @@ function toPercents(buckets: BucketRaw[]): RiskBandPoint[] {
       flowDirection: flowDirection(valueNow, value7dAgo)
     } satisfies RiskBandPoint
   })
-
-  // If rounding drift occurs, we accept it (frontend can normalize if needed).
-  return points
 }
 
-async function fetchJson<T>(url: string, init?: RequestInit): Promise<{ ok: true; data: T } | { ok: false; error: string }> {
+async function fetchJson<T>(
+  url: string,
+  init?: RequestInit
+): Promise<{ ok: true; data: T } | { ok: false; error: string }> {
   try {
     const res = await fetch(url, {
       ...init,
       cache: 'no-store',
       signal: AbortSignal.timeout(8000)
     })
-
     if (!res.ok) return { ok: false, error: `HTTP ${res.status}` }
-
     const data = (await res.json()) as T
     return { ok: true, data }
   } catch (e) {
-    const msg = e instanceof Error ? e.message : 'Fetch failed'
-    return { ok: false, error: msg }
+    return { ok: false, error: e instanceof Error ? e.message : 'Fetch failed' }
   }
 }
 
@@ -110,7 +118,16 @@ function yyyymmdd(d: Date): string {
   return `${yyyy}-${mm}-${dd}`
 }
 
-function nearestAtOrBefore(points: Array<{ t: string; v: number }>, targetIsoDate: string): number | null {
+/** Returns YTD start date string for the current year (Jan 1) */
+function ytdStart(): string {
+  const now = new Date()
+  return `${now.getUTCFullYear()}-01-01`
+}
+
+function nearestAtOrBefore(
+  points: Array<{ t: string; v: number }>,
+  targetIsoDate: string
+): number | null {
   const target = new Date(targetIsoDate).getTime()
   let best: { t: string; v: number } | null = null
   for (const p of points) {
@@ -122,197 +139,255 @@ function nearestAtOrBefore(points: Array<{ t: string; v: number }>, targetIsoDat
   return best?.v ?? null
 }
 
-async function fetchFredLatestAnd7dAgo(seriesId: string): Promise<{ now: number | null; prev: number | null; warning?: string }> {
+// ── FRED ─────────────────────────────────────────────────────────────────
+
+async function fetchFredSeries(seriesId: string): Promise<{
+  now: number | null
+  prev7d: number | null
+  prevYtd: number | null
+  warning?: string
+}> {
   const apiKey = process.env.FRED_API_KEY
   const endpoint = `https://api.stlouisfed.org/fred/series/observations?series_id=${encodeURIComponent(
     seriesId
-  )}&api_key=${encodeURIComponent(apiKey ?? '')}&file_type=json&sort_order=desc&limit=50`
+  )}&api_key=${encodeURIComponent(apiKey ?? '')}&file_type=json&sort_order=desc&limit=200`
 
-  if (!apiKey) return { now: null, prev: null, warning: 'FRED_API_KEY missing' }
+  if (!apiKey) return { now: null, prev7d: null, prevYtd: null, warning: 'FRED_API_KEY missing' }
 
   const res = await fetchJson<{ observations?: Array<{ date: string; value: string }> }>(endpoint)
-  if (!res.ok) return { now: null, prev: null, warning: `FRED ${seriesId}: ${res.error}` }
+  if (!res.ok)
+    return { now: null, prev7d: null, prevYtd: null, warning: `FRED ${seriesId}: ${res.error}` }
 
   const obs = (res.data.observations ?? [])
-    .filter((o) => typeof o?.date === 'string' && typeof o?.value === 'string' && o.value !== '.')
+    .filter((o) => typeof o?.date === 'string' && o.value !== '.')
     .map((o) => ({ t: o.date, v: Number(o.value) }))
     .filter((p) => Number.isFinite(p.v))
-    .reverse() // ascending
+    .reverse() // asc
 
-  if (obs.length === 0) return { now: null, prev: null, warning: `FRED ${seriesId}: no data` }
+  if (!obs.length) return { now: null, prev7d: null, prevYtd: null, warning: `FRED ${seriesId}: no data` }
 
-  const now = obs[obs.length - 1]!.v
-  const d = new Date(obs[obs.length - 1]!.t)
-  d.setUTCDate(d.getUTCDate() - 7)
-  const prev = nearestAtOrBefore(obs, yyyymmdd(d))
+  const latest = obs[obs.length - 1]!
+  const now = latest.v
 
-  return { now, prev: prev ?? now, ...(prev == null ? { warning: `FRED ${seriesId}: no 7d point (used latest)` } : {}) }
+  const d7 = new Date(latest.t)
+  d7.setUTCDate(d7.getUTCDate() - 7)
+  const prev7d = nearestAtOrBefore(obs, yyyymmdd(d7))
+
+  const prevYtd = nearestAtOrBefore(obs, ytdStart())
+
+  return { now, prev7d: prev7d ?? now, prevYtd: prevYtd ?? now }
 }
 
-async function fetchDefiLlamaTvl(): Promise<{ now: number | null; prev: number | null; warning?: string }>{
-  // Total TVL chart
-  const endpoint = 'https://api.llama.fi/v2/charts'
-  const res = await fetchJson<Array<{ date: number; totalLiquidityUSD: number }>>(endpoint)
-  if (!res.ok) return { now: null, prev: null, warning: `DeFiLlama: ${res.error}` }
+// ── DeFiLlama ────────────────────────────────────────────────────────────
+
+async function fetchDefiLlamaTvl(): Promise<{
+  now: number | null
+  prev7d: number | null
+  prevYtd: number | null
+  warning?: string
+}> {
+  const res = await fetchJson<Array<{ date: number; totalLiquidityUSD: number }>>(
+    'https://api.llama.fi/v2/charts'
+  )
+  if (!res.ok) return { now: null, prev7d: null, prevYtd: null, warning: `DeFiLlama: ${res.error}` }
 
   const points = (res.data ?? [])
-    .map((r) => ({
-      t: yyyymmdd(new Date((r.date ?? 0) * 1000)),
-      v: Number(r.totalLiquidityUSD)
-    }))
+    .map((r) => ({ t: yyyymmdd(new Date((r.date ?? 0) * 1000)), v: Number(r.totalLiquidityUSD) }))
     .filter((p) => Number.isFinite(p.v))
 
-  if (points.length === 0) return { now: null, prev: null, warning: 'DeFiLlama: no data' }
+  if (!points.length) return { now: null, prev7d: null, prevYtd: null, warning: 'DeFiLlama: no data' }
 
-  const now = points[points.length - 1]!.v
-  const d = new Date(points[points.length - 1]!.t)
-  d.setUTCDate(d.getUTCDate() - 7)
-  const prev = nearestAtOrBefore(points, yyyymmdd(d))
+  const latest = points[points.length - 1]!
+  const now = latest.v
 
-  return { now, prev: prev ?? now, ...(prev == null ? { warning: 'DeFiLlama: no 7d point (used latest)' } : {}) }
+  const d7 = new Date(latest.t)
+  d7.setUTCDate(d7.getUTCDate() - 7)
+
+  return {
+    now,
+    prev7d: nearestAtOrBefore(points, yyyymmdd(d7)) ?? now,
+    prevYtd: nearestAtOrBefore(points, ytdStart()) ?? now
+  }
 }
 
-async function fetchCoinGeckoMarketCaps(coinId: 'bitcoin' | 'ethereum'): Promise<{ now: number | null; prev: number | null; warning?: string }> {
+// ── CoinGecko — coin market chart ────────────────────────────────────────
+
+async function fetchCoinGeckoMarketCaps(coinId: 'bitcoin' | 'ethereum'): Promise<{
+  now: number | null
+  prev7d: number | null
+  prevYtd: number | null
+  warning?: string
+}> {
+  // request 365 days to cover YTD
   const endpoint = `https://api.coingecko.com/api/v3/coins/${encodeURIComponent(
     coinId
-  )}/market_chart?vs_currency=usd&days=14&interval=daily`
+  )}/market_chart?vs_currency=usd&days=365&interval=daily`
 
   const headers: Record<string, string> = {}
   const proKey = process.env.COINGECKO_API_KEY
   if (proKey) headers['x-cg-pro-api-key'] = proKey
 
   const res = await fetchJson<{ market_caps?: Array<[number, number]> }>(endpoint, { headers })
-  if (!res.ok) return { now: null, prev: null, warning: `CoinGecko ${coinId}: ${res.error}` }
+  if (!res.ok)
+    return { now: null, prev7d: null, prevYtd: null, warning: `CoinGecko ${coinId}: ${res.error}` }
 
   const points = (res.data.market_caps ?? [])
     .map(([ms, v]) => ({ t: yyyymmdd(new Date(ms)), v: Number(v) }))
     .filter((p) => Number.isFinite(p.v))
 
-  if (points.length === 0) return { now: null, prev: null, warning: `CoinGecko ${coinId}: no market_caps` }
+  if (!points.length)
+    return { now: null, prev7d: null, prevYtd: null, warning: `CoinGecko ${coinId}: no market_caps` }
 
-  const now = points[points.length - 1]!.v
-  // try exact 7d ago
-  const d = new Date(points[points.length - 1]!.t)
-  d.setUTCDate(d.getUTCDate() - 7)
-  const prev = nearestAtOrBefore(points, yyyymmdd(d))
+  const latest = points[points.length - 1]!
+  const now = latest.v
 
-  return { now, prev: prev ?? now, ...(prev == null ? { warning: `CoinGecko ${coinId}: no 7d point (used latest)` } : {}) }
+  const d7 = new Date(latest.t)
+  d7.setUTCDate(d7.getUTCDate() - 7)
+
+  return {
+    now,
+    prev7d: nearestAtOrBefore(points, yyyymmdd(d7)) ?? now,
+    prevYtd: nearestAtOrBefore(points, ytdStart()) ?? now
+  }
 }
 
-async function fetchCoinGeckoGlobalMcap(): Promise<{ now: number | null; prev: number | null; warning?: string }> {
+// ── CoinGecko — global market cap ────────────────────────────────────────
+
+async function fetchCoinGeckoGlobal(): Promise<{
+  now: number | null
+  prev7d: number | null
+  prevYtd: number | null
+  warning?: string
+}> {
   const headers: Record<string, string> = {}
   const proKey = process.env.COINGECKO_API_KEY
   if (proKey) headers['x-cg-pro-api-key'] = proKey
 
-  // Current global market cap
   const globalRes = await fetchJson<{ data?: { total_market_cap?: { usd?: number } } }>(
     'https://api.coingecko.com/api/v3/global',
     { headers }
   )
   const now = globalRes.ok ? safeNumber(globalRes.data?.data?.total_market_cap?.usd) : null
 
-  // Try (best-effort) historical global market cap chart.
-  // Not guaranteed to exist on all tiers; if this fails we fall back to now.
+  if (!now)
+    return {
+      now: null,
+      prev7d: null,
+      prevYtd: null,
+      warning: `CoinGecko global: ${globalRes.ok ? 'missing usd' : globalRes.error}`
+    }
+
   const chartRes = await fetchJson<{ market_caps?: Array<[number, number]> }>(
-    'https://api.coingecko.com/api/v3/global/market_cap_chart?vs_currency=usd&days=14',
+    'https://api.coingecko.com/api/v3/global/market_cap_chart?vs_currency=usd&days=365',
     { headers }
   )
 
-  if (!now) {
-    return {
-      now: null,
-      prev: null,
-      warning: `CoinGecko global: ${globalRes.ok ? 'missing usd' : globalRes.error}`
-    }
-  }
-
-  if (!chartRes.ok) {
+  if (!chartRes.ok)
     return {
       now,
-      prev: now,
-      warning: `CoinGecko global: no history (${chartRes.error}); used latest as 7d-ago`
+      prev7d: now,
+      prevYtd: now,
+      warning: `CoinGecko global: no history (${chartRes.error}); used latest`
     }
-  }
 
   const points = (chartRes.data.market_caps ?? [])
     .map(([ms, v]) => ({ t: yyyymmdd(new Date(ms)), v: Number(v) }))
     .filter((p) => Number.isFinite(p.v))
 
-  if (points.length === 0) return { now, prev: now, warning: 'CoinGecko global: empty history; used latest' }
+  if (!points.length)
+    return { now, prev7d: now, prevYtd: now, warning: 'CoinGecko global: empty history' }
 
-  const d = new Date(points[points.length - 1]!.t)
-  d.setUTCDate(d.getUTCDate() - 7)
-  const prev = nearestAtOrBefore(points, yyyymmdd(d))
+  const latest = points[points.length - 1]!
+  const d7 = new Date(latest.t)
+  d7.setUTCDate(d7.getUTCDate() - 7)
 
-  return { now, prev: prev ?? now, ...(prev == null ? { warning: 'CoinGecko global: no 7d point; used latest' } : {}) }
+  return {
+    now,
+    prev7d: nearestAtOrBefore(points, yyyymmdd(d7)) ?? now,
+    prevYtd: nearestAtOrBefore(points, ytdStart()) ?? now
+  }
 }
 
-async function fetchFmpEtfNetAssets(symbol: string): Promise<{ now: number | null; warning?: string }> {
+// ── FMP — ETF net assets ─────────────────────────────────────────────────
+
+async function fetchFmpEtfNetAssets(symbol: string): Promise<{
+  now: number | null
+  warning?: string
+}> {
   const apiKey = process.env.FMP_API_KEY
+  if (!apiKey) return { now: null, warning: 'FMP_API_KEY missing' }
+
   const endpoint = `https://financialmodelingprep.com/api/v4/etf-info?symbol=${encodeURIComponent(
     symbol
-  )}&apikey=${encodeURIComponent(apiKey ?? '')}`
-
-  if (!apiKey) return { now: null, warning: 'FMP_API_KEY missing' }
+  )}&apikey=${encodeURIComponent(apiKey)}`
 
   const res = await fetchJson<Array<{ netAssets?: number | string }>>(endpoint)
   if (!res.ok) return { now: null, warning: `FMP etf-info ${symbol}: ${res.error}` }
 
-  const row = Array.isArray(res.data) ? res.data[0] : undefined
-  const net = safeNumber(row?.netAssets)
+  const net = safeNumber(Array.isArray(res.data) ? res.data[0]?.netAssets : undefined)
   if (!net) return { now: null, warning: `FMP etf-info ${symbol}: missing netAssets` }
   return { now: net }
 }
 
-async function fetchAlphaVantageCommoditiesProxy(): Promise<{ now: number | null; prev: number | null; warning?: string }> {
-  // Use weekly WTI as a crude commodity proxy (best-effort).
+// ── AlphaVantage — WTI weekly ────────────────────────────────────────────
+
+async function fetchWtiNotional(): Promise<{
+  now: number | null
+  prev7d: number | null
+  prevYtd: number | null
+  warning?: string
+}> {
   const apiKey = process.env.ALPHAVANTAGE_API_KEY
+  if (!apiKey)
+    return { now: null, prev7d: null, prevYtd: null, warning: 'ALPHAVANTAGE_API_KEY missing' }
+
   const endpoint = `https://www.alphavantage.co/query?function=WTI&interval=weekly&apikey=${encodeURIComponent(
-    apiKey ?? ''
+    apiKey
   )}`
 
-  if (!apiKey) return { now: null, prev: null, warning: 'ALPHAVANTAGE_API_KEY missing' }
-
   const res = await fetchJson<{ data?: Array<{ date?: string; value?: string }> }>(endpoint)
-  if (!res.ok) return { now: null, prev: null, warning: `AlphaVantage WTI: ${res.error}` }
+  if (!res.ok)
+    return { now: null, prev7d: null, prevYtd: null, warning: `AlphaVantage WTI: ${res.error}` }
 
   const points = (res.data.data ?? [])
     .filter((r) => typeof r?.date === 'string')
     .map((r) => ({ t: r.date as string, v: Number(r.value) }))
     .filter((p) => Number.isFinite(p.v))
-    .reverse() // assume desc from AV, make asc
+    .reverse() // make ascending
 
-  if (points.length === 0) return { now: null, prev: null, warning: 'AlphaVantage WTI: no data' }
+  if (!points.length)
+    return { now: null, prev7d: null, prevYtd: null, warning: 'AlphaVantage WTI: no data' }
 
-  const now = points[points.length - 1]!.v
-  const d = new Date(points[points.length - 1]!.t)
-  d.setUTCDate(d.getUTCDate() - 7)
-  const prev = nearestAtOrBefore(points, yyyymmdd(d))
+  const latest = points[points.length - 1]!
+  // Scale WTI (USD/bbl) into a notional bucket (100 USD/bbl ≈ 1T)
+  const toNotional = (price: number) => price * 10_000_000_000
 
-  // Scale WTI price (USD/bbl) into a notional USD bucket so it can be mixed with other buckets.
-  // We treat it as an index and assign an arbitrary notional of 1T * (price / 100).
-  const notionalNow = now * 10_000_000_000 // 100 => 1T
-  const notionalPrev = (prev ?? now) * 10_000_000_000
+  const d7 = new Date(latest.t)
+  d7.setUTCDate(d7.getUTCDate() - 7)
+  const p7 = nearestAtOrBefore(points, yyyymmdd(d7))
+  const pYtd = nearestAtOrBefore(points, ytdStart())
 
   return {
-    now: notionalNow,
-    prev: notionalPrev,
-    ...(prev == null ? { warning: 'AlphaVantage WTI: no 7d point (used latest)' } : {})
+    now: toNotional(latest.v),
+    prev7d: toNotional(p7 ?? latest.v),
+    prevYtd: toNotional(pYtd ?? latest.v)
   }
 }
 
+// ── Mock buckets ──────────────────────────────────────────────────────────
+
 function mockBuckets(): Record<BucketKey, BucketRaw> {
-  // Conservative, plausible magnitudes (USD). Only used on total failure.
-  const base: Record<BucketKey, BucketRaw> = {
-    R1: { key: 'R1', name: 'Cash Equiv.', valueNowUsd: 8.5e12, value7dAgoUsd: 8.4e12, sources: ['mock'] },
-    R2: { key: 'R2', name: 'Low Risk', valueNowUsd: 1.1e11, value7dAgoUsd: 1.05e11, sources: ['mock'] },
-    R3: { key: 'R3', name: 'Core Equity', valueNowUsd: 1.05e14, value7dAgoUsd: 1.03e14, sources: ['mock'] },
-    R4: { key: 'R4', name: 'Hard Assets', valueNowUsd: 2.2e13, value7dAgoUsd: 2.15e13, sources: ['mock'] },
-    R5: { key: 'R5', name: 'Commodities', valueNowUsd: 9.5e11, value7dAgoUsd: 9.7e11, sources: ['mock'] },
-    R6: { key: 'R6', name: 'Risk ON', valueNowUsd: 6.5e11, value7dAgoUsd: 6.2e11, sources: ['mock'] }
+  return {
+    R1: { key: 'R1', name: '$',                valueNowUsd: 8.5e12, value7dAgoUsd: 8.4e12,  valueYtdAgoUsd: 8.0e12,  sources: ['mock'] },
+    R2: { key: 'R2', name: 'Low Risk',          valueNowUsd: 1.1e11, value7dAgoUsd: 1.05e11, valueYtdAgoUsd: 9.5e10,  sources: ['mock'] },
+    R3: { key: 'R3', name: 'Core Equity',       valueNowUsd: 1.05e14, value7dAgoUsd: 1.03e14, valueYtdAgoUsd: 1.0e14, sources: ['mock'] },
+    R4: { key: 'R4', name: 'Risk OFF',          valueNowUsd: 2.2e13, value7dAgoUsd: 2.15e13, valueYtdAgoUsd: 2.0e13,  sources: ['mock'] },
+    R5: { key: 'R5', name: 'Vital Commodities', valueNowUsd: 9.5e11, value7dAgoUsd: 9.7e11,  valueYtdAgoUsd: 9.0e11,  sources: ['mock'] },
+    R6: { key: 'R6', name: 'Risk ON',           valueNowUsd: 6.5e11, value7dAgoUsd: 6.2e11,  valueYtdAgoUsd: 5.0e11,  sources: ['mock'] }
   }
-  return base
 }
+
+// ── Main export ───────────────────────────────────────────────────────────
 
 export async function getGModeRadarPayload(): Promise<MacroOracleRadarPayload> {
   const nowMs = Date.now()
@@ -321,157 +396,160 @@ export async function getGModeRadarPayload(): Promise<MacroOracleRadarPayload> {
   const warnings: string[] = []
   const raw = mockBuckets()
 
-  // ── R1 Cash equiv: MMMF + T-bills (FRED) ────────────────────────────────
+  // ── R1 $ (Cash / Money Markets) ─────────────────────────────────────────
   try {
     const [mmmf, tbills] = await Promise.all([
-      fetchFredLatestAnd7dAgo('MMMFFAQ027S'),
-      fetchFredLatestAnd7dAgo('WRMFSL')
+      fetchFredSeries('MMMFFAQ027S'),
+      fetchFredSeries('WRMFSL')
     ])
-
     if (mmmf.warning) warnings.push(mmmf.warning)
     if (tbills.warning) warnings.push(tbills.warning)
 
     const now = (mmmf.now ?? 0) + (tbills.now ?? 0)
-    const prev = (mmmf.prev ?? mmmf.now ?? 0) + (tbills.prev ?? tbills.now ?? 0)
-    if (now > 0 && prev > 0) {
+    const prev7d = (mmmf.prev7d ?? mmmf.now ?? 0) + (tbills.prev7d ?? tbills.now ?? 0)
+    const prevYtd = (mmmf.prevYtd ?? mmmf.now ?? 0) + (tbills.prevYtd ?? tbills.now ?? 0)
+
+    if (now > 0) {
       raw.R1 = {
         key: 'R1',
-        name: 'Cash Equiv.',
+        name: '$',
         valueNowUsd: now,
-        value7dAgoUsd: prev,
-        sources: ['FRED:MMMFFAQ027S', 'FRED:WRMFSL'],
-        warnings: [mmmf.warning, tbills.warning].filter((x): x is string => Boolean(x))
+        value7dAgoUsd: prev7d,
+        valueYtdAgoUsd: prevYtd,
+        sources: ['FRED:MMMFFAQ027S', 'FRED:WRMFSL']
       }
     } else {
-      warnings.push('R1: FRED returned empty; used mock')
+      warnings.push('R1: FRED empty; used mock')
     }
   } catch (e) {
-    warnings.push(`R1: unexpected error (used mock): ${e instanceof Error ? e.message : 'unknown'}`)
+    warnings.push(`R1: error (mock): ${e instanceof Error ? e.message : 'unknown'}`)
   }
 
-  // ── R2 Low Risk: DeFiLlama total TVL ────────────────────────────────────
+  // ── R2 Low Risk (DeFi TVL) ───────────────────────────────────────────────
   try {
     const tvl = await fetchDefiLlamaTvl()
     if (tvl.warning) warnings.push(tvl.warning)
-    if (tvl.now && tvl.prev) {
+    if (tvl.now && tvl.prev7d && tvl.prevYtd) {
       raw.R2 = {
         key: 'R2',
         name: 'Low Risk',
         valueNowUsd: tvl.now,
-        value7dAgoUsd: tvl.prev,
-        sources: ['DeFiLlama:v2/charts'],
-        warnings: tvl.warning ? [tvl.warning] : undefined
+        value7dAgoUsd: tvl.prev7d,
+        valueYtdAgoUsd: tvl.prevYtd,
+        sources: ['DeFiLlama:v2/charts']
       }
     } else {
-      warnings.push('R2: DeFiLlama returned empty; used mock')
+      warnings.push('R2: DeFiLlama empty; used mock')
     }
   } catch (e) {
-    warnings.push(`R2: unexpected error (used mock): ${e instanceof Error ? e.message : 'unknown'}`)
+    warnings.push(`R2: error (mock): ${e instanceof Error ? e.message : 'unknown'}`)
   }
 
-  // ── R3 Core Equity: SPY netAssets * multiplier (FMP) ────────────────────
+  // ── R3 Core Equity (SPY AUM proxy) ──────────────────────────────────────
   try {
     const spy = await fetchFmpEtfNetAssets('SPY')
     if (spy.warning) warnings.push(spy.warning)
-    // SPY netAssets in USD; multiply to approximate global equity market cap.
-    const multiplier = 200
     if (spy.now) {
+      const multiplier = 200
       const now = spy.now * multiplier
-      // best-effort: infer 7d-ago by applying a small drift (avoid hard dependency on another endpoint)
-      const prev = now * 0.99
       raw.R3 = {
         key: 'R3',
         name: 'Core Equity',
         valueNowUsd: now,
-        value7dAgoUsd: prev,
+        value7dAgoUsd: now * 0.99,
+        valueYtdAgoUsd: now * 0.95,
         sources: [`FMP:etf-info(SPY)*${multiplier}x`],
-        warnings: spy.warning ? [spy.warning, 'R3: 7d-ago derived (no historical AUM endpoint)'] : ['R3: 7d-ago derived (no historical AUM endpoint)']
+        warnings: ['7d/YTD derived (no historical SPY AUM endpoint)']
       }
     } else {
-      warnings.push('R3: FMP SPY netAssets missing; used mock')
+      warnings.push('R3: FMP SPY missing; used mock')
     }
   } catch (e) {
-    warnings.push(`R3: unexpected error (used mock): ${e instanceof Error ? e.message : 'unknown'}`)
+    warnings.push(`R3: error (mock): ${e instanceof Error ? e.message : 'unknown'}`)
   }
 
-  // ── R4 Hard Assets: BTC mcap (CoinGecko) + GLD netAssets (FMP) ──────────
+  // ── R4 Risk OFF (BTC + Gold) ─────────────────────────────────────────────
   try {
     const [btc, gld] = await Promise.all([fetchCoinGeckoMarketCaps('bitcoin'), fetchFmpEtfNetAssets('GLD')])
     if (btc.warning) warnings.push(btc.warning)
     if (gld.warning) warnings.push(gld.warning)
 
-    if (btc.now && btc.prev) {
+    if (btc.now && btc.prev7d) {
       const gldNow = gld.now ?? 0
-      const gldPrev = (gld.now ?? 0) * 0.99 // no history; approximate
       raw.R4 = {
         key: 'R4',
-        name: 'Hard Assets',
+        name: 'Risk OFF',
         valueNowUsd: btc.now + gldNow,
-        value7dAgoUsd: btc.prev + gldPrev,
+        value7dAgoUsd: btc.prev7d + (gldNow * 0.99),
+        valueYtdAgoUsd: (btc.prevYtd ?? btc.now) + (gldNow * 0.92),
         sources: ['CoinGecko:bitcoin market_caps', 'FMP:etf-info(GLD)'],
-        warnings: [btc.warning, gld.warning, gld.now ? 'R4: GLD 7d-ago derived (no historical AUM endpoint)' : undefined].filter(
-          (x): x is string => Boolean(x)
-        )
+        warnings: gld.now ? ['GLD 7d/YTD derived (no historical AUM)'] : ['GLD missing, BTC only']
       }
     } else {
-      warnings.push('R4: CoinGecko BTC market cap missing; used mock')
+      warnings.push('R4: CoinGecko BTC missing; used mock')
     }
   } catch (e) {
-    warnings.push(`R4: unexpected error (used mock): ${e instanceof Error ? e.message : 'unknown'}`)
+    warnings.push(`R4: error (mock): ${e instanceof Error ? e.message : 'unknown'}`)
   }
 
-  // ── R5 Commodities: AlphaVantage WTI notional proxy ─────────────────────
+  // ── R5 Vital Commodities (WTI proxy) ────────────────────────────────────
   try {
-    const cmd = await fetchAlphaVantageCommoditiesProxy()
+    const cmd = await fetchWtiNotional()
     if (cmd.warning) warnings.push(cmd.warning)
-    if (cmd.now && cmd.prev) {
+    if (cmd.now && cmd.prev7d && cmd.prevYtd) {
       raw.R5 = {
         key: 'R5',
-        name: 'Commodities',
+        name: 'Vital Commodities',
         valueNowUsd: cmd.now,
-        value7dAgoUsd: cmd.prev,
-        sources: ['AlphaVantage:WTI(weekly) notional'],
-        warnings: cmd.warning ? [cmd.warning] : undefined
+        value7dAgoUsd: cmd.prev7d,
+        valueYtdAgoUsd: cmd.prevYtd,
+        sources: ['AlphaVantage:WTI(weekly) notional']
       }
     } else {
-      warnings.push('R5: AlphaVantage WTI missing; used mock')
+      warnings.push('R5: AV WTI missing; used mock')
     }
   } catch (e) {
-    warnings.push(`R5: unexpected error (used mock): ${e instanceof Error ? e.message : 'unknown'}`)
+    warnings.push(`R5: error (mock): ${e instanceof Error ? e.message : 'unknown'}`)
   }
 
-  // ── R6 Risk ON: total crypto mcap - BTC - ETH ───────────────────────────
+  // ── R6 Risk ON (altcoin market cap = total - BTC - ETH) ──────────────────
   try {
     const [global, btc, eth] = await Promise.all([
-      fetchCoinGeckoGlobalMcap(),
+      fetchCoinGeckoGlobal(),
       fetchCoinGeckoMarketCaps('bitcoin'),
       fetchCoinGeckoMarketCaps('ethereum')
     ])
-
     if (global.warning) warnings.push(global.warning)
     if (btc.warning) warnings.push(btc.warning)
     if (eth.warning) warnings.push(eth.warning)
 
     if (global.now && btc.now && eth.now) {
-      const altNow = Math.max(0, global.now - btc.now - eth.now)
-      const altPrev = Math.max(0, (global.prev ?? global.now) - (btc.prev ?? btc.now) - (eth.prev ?? eth.now))
       raw.R6 = {
         key: 'R6',
         name: 'Risk ON',
-        valueNowUsd: altNow,
-        value7dAgoUsd: altPrev,
-        sources: ['CoinGecko:global total_market_cap', 'CoinGecko:bitcoin market_caps', 'CoinGecko:ethereum market_caps'],
-        warnings: [global.warning, btc.warning, eth.warning].filter((x): x is string => Boolean(x))
+        valueNowUsd: Math.max(0, global.now - btc.now - eth.now),
+        value7dAgoUsd: Math.max(
+          0,
+          (global.prev7d ?? global.now) - (btc.prev7d ?? btc.now) - (eth.prev7d ?? eth.now)
+        ),
+        valueYtdAgoUsd: Math.max(
+          0,
+          (global.prevYtd ?? global.now) - (btc.prevYtd ?? btc.now) - (eth.prevYtd ?? eth.now)
+        ),
+        sources: ['CoinGecko:global', 'CoinGecko:bitcoin', 'CoinGecko:ethereum']
       }
     } else {
-      warnings.push('R6: CoinGecko global/btc/eth missing; used mock')
+      warnings.push('R6: CoinGecko missing; used mock')
     }
   } catch (e) {
-    warnings.push(`R6: unexpected error (used mock): ${e instanceof Error ? e.message : 'unknown'}`)
+    warnings.push(`R6: error (mock): ${e instanceof Error ? e.message : 'unknown'}`)
   }
 
   const buckets = (Object.values(raw) as BucketRaw[]).sort((a, b) => a.key.localeCompare(b.key))
   const bands = toPercents(buckets)
+
+  // Compute total tracked AUM for absolute dollar display
+  const totalNow = buckets.reduce((s, b) => s + b.valueNowUsd, 0)
 
   const payload: MacroOracleRadarPayload = {
     asOf: isoNow(),
@@ -479,9 +557,12 @@ export async function getGModeRadarPayload(): Promise<MacroOracleRadarPayload> {
     bands,
     meta: {
       source: 'gmode',
+      totalTrackedUsd: totalNow,
       denom: 'sum(buckets_now_usd)',
       bucketsNowUsd: Object.fromEntries(buckets.map((b) => [b.key, b.valueNowUsd])),
       buckets7dAgoUsd: Object.fromEntries(buckets.map((b) => [b.key, b.value7dAgoUsd])),
+      bucketsYtdAgoUsd: Object.fromEntries(buckets.map((b) => [b.key, b.valueYtdAgoUsd])),
+      bucketSources: Object.fromEntries(buckets.map((b) => [b.key, b.sources])),
       warnings
     }
   }
