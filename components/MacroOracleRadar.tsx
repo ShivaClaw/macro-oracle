@@ -4,5 +4,6 @@ export { default } from './charts/MacroOracleRadar/MacroOracleRadar';
 export type {
   MacroOracleRadarPayload,
   MacroOracleRadarProps,
-  RiskBandPoint
+  RiskBandPoint,
+  MacroOracleMode
 } from './charts/MacroOracleRadar/types';
