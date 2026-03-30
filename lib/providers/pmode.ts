@@ -1,355 +1,228 @@
 /**
- * pmode.ts
+ * P-mode (Personal Portfolio) data fetcher
  *
- * P-mode (Personal) portfolio radar payload.
+ * Required Vercel env vars:
+ *   HELIUS_API_KEY      - Helius RPC key for Solana token data
  *
- * Required env vars (recommended):
- *  - DEBANK_ACCESS_KEY   (DeBank Pro OpenAPI access key)
- *  - HELIUS_API_KEY      (Helius RPC key)
+ * Free APIs (no key needed):
+ *   Ethplorer           - Ethereum + ERC20 balances (freekey tier)
+ *   Solana mainnet RPC  - Native SOL balance
+ *   Hyperliquid         - Perp account state
  *
- * Optional:
- *  - ZAPPER_API_KEY      (reserved; not used yet)
- *
- * Notes:
- *  - Uses best-effort fetches; never throws.
- *  - All upstream requests use AbortSignal.timeout(8000).
+ * Wallet addresses are hardcoded but can be moved to env vars:
+ *   ETH_WALLET_ADDRESS  - EVM wallet (Ethereum + Base)
+ *   SOL_WALLET_ADDRESS  - Solana wallet
  */
 
-import type { MacroOracleRadarPayload, RiskBandPoint } from '@/components/charts/MacroOracleRadar/types'
-import { cacheGet, cacheKey, cacheSet } from '@/lib/cache'
-import {
-  classifyProtocolPosition,
-  classifySpotToken,
-  P_RISK_BANDS,
-  type PRiskBandKey
-} from '@/lib/config/tokenClassification'
+import type { FlowDirection, MacroOracleRadarPayload, RiskBandPoint } from '../../components/charts/MacroOracleRadar/types';
+import { classifyToken, classifyProtocolPosition } from '../config/tokenClassification';
 
-// ── Constants (G wallets) ─────────────────────────────────────────────────
+const ETH_ADDRESS = process.env.ETH_WALLET_ADDRESS ?? '0x27B968f509f54fE6B9b247044C69e6634010D5a8';
+const SOL_ADDRESS = process.env.SOL_WALLET_ADDRESS ?? 'ERzA234UwbioGbnK9bS5P4q5ZeTYFkEzPAuiqgzgUq9K';
+const HELIUS_KEY  = process.env.HELIUS_API_KEY ?? '409fa16c-3d80-42e7-9fde-df9d037c59ac';
 
-const G_EVM_WALLET = '0x27B968f509f54fE6B9b247044C69e6634010D5a8'
-const G_SOL_WALLET = 'ERzA234UwbioGbnK9bS5P4q5ZeTYFkEzPAuiqgzgUq9K'
+const CACHE_TTL_MS = 5 * 60 * 1000;
+type CacheEntry = { data: MacroOracleRadarPayload; fetchedAt: number };
+let cache: CacheEntry | null = null;
+let prevSnapshot: Record<string, number> | null = null;
 
-const DEBANK_BASE = 'https://pro-openapi.debank.com/v1'
-const HYPERLIQUID_INFO = 'https://api.hyperliquid.xyz/info'
+// ── Band metadata ──────────────────────────────────────────────────────────
 
-const TTL_SECONDS = 300
+const BAND_META: Record<string, { label: string; name: string }> = {
+  R1: { label: 'RISK 1', name: 'Cash Equiv.'  },
+  R2: { label: 'RISK 2', name: 'Low Risk'     },
+  R3: { label: 'RISK 3', name: 'Core Equity'  },
+  R4: { label: 'RISK 4', name: 'Hard Assets'  },
+  R5: { label: 'RISK 5', name: 'Commodities'  },
+  R6: { label: 'RISK 6', name: 'Risk ON'      },
+  R7: { label: 'RISK 7', name: 'Venture'      },
+  R8: { label: 'RISK 8', name: 'Trading'      },
+};
 
-// ── Minimal upstream types (best-effort) ──────────────────────────────────
+// ── Fetchers ───────────────────────────────────────────────────────────────
 
-type DebankToken = {
-  chain?: string
-  id?: string // token contract address
-  symbol?: string
-  amount?: number
-  price?: number
-  is_verified?: boolean
-  is_core?: boolean
-}
-
-type DebankProtocol = {
-  id?: string
-  name?: string
-  chain?: string
-  portfolio_item_list?: Array<{
-    name?: string
-    stats?: { net_usd_value?: number }
-    detail?: Record<string, unknown>
-    // debank often includes: type / pool / supply tokens, etc.
-    // keep it loose to survive schema drift
-  }>
-}
-
-type HyperliquidClearinghouseState = {
-  marginSummary?: {
-    accountValue?: string
-    totalNtlPos?: string
-  }
-  assetPositions?: Array<{ position?: { coin?: string; positionValue?: string } }>
-  time?: number
-}
-
-type HeliusGetAssetsByOwnerResponse = {
-  result?: {
-    items?: Array<{
-      interface?: string
-      id?: string
-      content?: {
-        metadata?: { name?: string; symbol?: string }
-      }
-      token_info?: {
-        symbol?: string
-        decimals?: number
-        price_info?: { total_price?: number; price_per_token?: number }
-      }
-    }>
-  }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────
-
-function nowIso(): string {
-  return new Date().toISOString()
-}
-
-function num(v: unknown): number {
-  if (typeof v === 'number' && Number.isFinite(v)) return v
-  if (typeof v === 'string') {
-    const n = Number(v)
-    if (Number.isFinite(n)) return n
-  }
-  return 0
-}
-
-function safePct(x: number): number {
-  if (!Number.isFinite(x) || x <= 0) return 0
-  return Number(x.toFixed(2))
-}
-
-function initBandMap(): Record<PRiskBandKey, number> {
-  return {
-    R0: 0,
-    R1: 0,
-    R2: 0,
-    R3: 0,
-    R4: 0,
-    R5: 0,
-    R6: 0,
-    R7: 0,
-    R8: 0
-  }
-}
-
-function addUsd(map: Record<PRiskBandKey, number>, band: PRiskBandKey, usd: number): void {
-  if (!Number.isFinite(usd) || usd <= 0) return
-  map[band] = (map[band] ?? 0) + usd
-}
-
-function getPmodeMemory(): {
-  lastPct?: Record<PRiskBandKey, number>
-  lastAsOf?: string
-} {
-  const g = globalThis as any
-  if (!g.__macroOraclePmode) g.__macroOraclePmode = {}
-  return g.__macroOraclePmode
-}
-
-async function fetchJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T | null> {
+async function fetchEthplorerBalances(): Promise<Record<string, number>> {
+  const bands: Record<string, number> = {};
   try {
-    const res = await fetch(input, { ...init, signal: AbortSignal.timeout(8000) })
-    if (!res.ok) return null
-    return (await res.json()) as T
-  } catch {
-    return null
-  }
+    const res = await fetch(
+      `https://api.ethplorer.io/getAddressInfo/${ETH_ADDRESS}?apiKey=freekey`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) return bands;
+    const data = await res.json() as any;
+
+    // Native ETH
+    const ethBal  = Number(data?.ETH?.balance ?? 0);
+    const ethRate = Number(data?.ETH?.price?.rate ?? 0);
+    const ethUsd  = ethBal * ethRate;
+    if (ethUsd > 0) {
+      const band = classifyToken('ETH', '');
+      bands[band] = (bands[band] ?? 0) + ethUsd;
+    }
+
+    // ERC20 tokens
+    for (const t of (data?.tokens ?? [])) {
+      const info    = t.tokenInfo ?? {};
+      const symbol  = String(info.symbol ?? '');
+      const address = String(info.address ?? '');
+      const decimals = Number(info.decimals ?? 18);
+      const bal     = Number(t.balance ?? 0) / Math.pow(10, decimals);
+      const rate    = typeof info.price === 'object' ? Number(info.price?.rate ?? 0) : 0;
+      const usd     = bal * rate;
+      if (usd < 0.01) continue;
+      const band = classifyToken(symbol.toUpperCase(), address.toLowerCase());
+      bands[band] = (bands[band] ?? 0) + usd;
+    }
+  } catch { /* fall through */ }
+  return bands;
 }
 
-// ── Upstream fetchers ─────────────────────────────────────────────────────
-
-async function fetchDebankTokens(address: string): Promise<DebankToken[]> {
-  const key = process.env.DEBANK_ACCESS_KEY
-  if (!key) return []
-  const url = `${DEBANK_BASE}/user/all_token_list?id=${address}&is_all=false`
-  const j = await fetchJson<DebankToken[]>(url, { headers: { AccessKey: key } })
-  return Array.isArray(j) ? j : []
-}
-
-async function fetchDebankProtocols(address: string): Promise<DebankProtocol[]> {
-  const key = process.env.DEBANK_ACCESS_KEY
-  if (!key) return []
-  const url = `${DEBANK_BASE}/user/all_complex_protocol_list?id=${address}`
-  const j = await fetchJson<DebankProtocol[]>(url, { headers: { AccessKey: key } })
-  return Array.isArray(j) ? j : []
-}
-
-async function fetchHyperliquidState(evmAddress: string): Promise<HyperliquidClearinghouseState | null> {
-  return await fetchJson<HyperliquidClearinghouseState>(HYPERLIQUID_INFO, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ type: 'clearinghouseState', user: evmAddress })
-  })
-}
-
-async function fetchHeliusAssets(solAddress: string): Promise<HeliusGetAssetsByOwnerResponse | null> {
-  const key = process.env.HELIUS_API_KEY
-  if (!key) return null
-  const url = `https://mainnet.helius-rpc.com/?api-key=${key}`
-  return await fetchJson<HeliusGetAssetsByOwnerResponse>(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 'pmode',
-      method: 'getAssetsByOwner',
-      params: {
-        ownerAddress: solAddress,
-        page: 1,
-        limit: 1000,
-        displayOptions: { showFungible: true }
+async function fetchHeliusBalances(): Promise<Record<string, number>> {
+  const bands: Record<string, number> = {};
+  try {
+    const res = await fetch(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1,
+          method: 'getAssetsByOwner',
+          params: {
+            ownerAddress: SOL_ADDRESS,
+            page: 1, limit: 100,
+            displayOptions: { showFungible: true, showNativeBalance: true }
+          }
+        }),
+        signal: AbortSignal.timeout(8000)
       }
-    })
-  })
+    );
+    if (!res.ok) return bands;
+    const data = await res.json() as any;
+    const result = data?.result ?? {};
+
+    // Native SOL
+    const solLamports = Number(result?.nativeBalance?.lamports ?? 0);
+    const solUsd      = Number(result?.nativeBalance?.total_price ?? 0);
+    if (solUsd > 0.01) {
+      const band = classifyToken('SOL', '');
+      bands[band] = (bands[band] ?? 0) + solUsd;
+    }
+    void solLamports;
+
+    // SPL tokens
+    for (const item of (result?.items ?? [])) {
+      if (item?.interface !== 'FungibleToken') continue;
+      const info    = item?.token_info ?? {};
+      const symbol  = String(info.symbol ?? '').toUpperCase();
+      const address = String(item?.id ?? '');
+      const usd     = Number(info?.price_info?.total_price ?? 0);
+      if (usd < 0.01) continue;
+      const band = classifyToken(symbol, address);
+      bands[band] = (bands[band] ?? 0) + usd;
+    }
+  } catch { /* fall through */ }
+  return bands;
 }
 
-// ── Core aggregation ──────────────────────────────────────────────────────
-
-function bandsToPoints(opts: {
-  pctByBand: Record<PRiskBandKey, number>
-  prevPctByBand?: Record<PRiskBandKey, number>
-}): RiskBandPoint[] {
-  const { pctByBand, prevPctByBand } = opts
-
-  // P-mode returns R1..R8 as axes; R0 is dry powder in meta.
-  const keys: PRiskBandKey[] = ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8']
-
-  return keys.map((k) => {
-    const def = P_RISK_BANDS.find((b) => b.key === k)
-    const valueNow = safePct(pctByBand[k] ?? 0)
-    const value7dAgo = prevPctByBand ? safePct(prevPctByBand[k] ?? 0) : undefined
-    const delta7d =
-      value7dAgo != null ? Number((valueNow - value7dAgo).toFixed(2)) : undefined
-
-    const point: RiskBandPoint = {
-      key: k,
-      label: def?.label ?? `RISK ${k.slice(1)}`,
-      name: def?.name,
-      valueNow,
-      ...(value7dAgo != null && { value7dAgo }),
-      ...(delta7d != null && { delta7d })
-    }
-
-    // crude flow direction heuristic
-    if (delta7d != null) {
-      point.flowDirection = delta7d > 0.25 ? 'inflow' : delta7d < -0.25 ? 'outflow' : 'neutral'
-    }
-
-    return point
-  })
+async function fetchHyperliquidR8(): Promise<number> {
+  try {
+    const res = await fetch('https://api.hyperliquid.xyz/info', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'clearinghouseState', user: ETH_ADDRESS }),
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!res.ok) return 0;
+    const data = await res.json() as any;
+    return Number(data?.marginSummary?.accountValue ?? 0);
+  } catch { return 0; }
 }
+
+// ── Main export ────────────────────────────────────────────────────────────
 
 export async function getPmodeRadarPayload(): Promise<MacroOracleRadarPayload> {
-  const key = cacheKey({ route: 'radar', mode: 'p', evm: G_EVM_WALLET, sol: G_SOL_WALLET })
-  const cached = await cacheGet<MacroOracleRadarPayload>(key, { allowStale: true })
-  if (cached.hit && cached.entry && !cached.stale) return cached.entry.value
+  const now = Date.now();
+  if (cache && (now - cache.fetchedAt) < CACHE_TTL_MS) return cache.data;
 
-  // Aggregate USD values per band.
-  const usdByBand = initBandMap()
-  const sourceStatus: Record<string, { ok: boolean; detail?: string }> = {}
+  const warnings: string[] = [];
 
-  // 1) DeBank spot tokens
-  {
-    const tokens = await fetchDebankTokens(G_EVM_WALLET)
-    sourceStatus.debankTokens = { ok: tokens.length > 0, detail: tokens.length ? `tokens=${tokens.length}` : 'empty' }
+  // Fetch all sources in parallel
+  const [ethBands, solBands, r8Usd] = await Promise.all([
+    fetchEthplorerBalances(),
+    fetchHeliusBalances(),
+    fetchHyperliquidR8(),
+  ]);
 
-    for (const t of tokens) {
-      const usd = num(t.amount) * num(t.price)
-      const band = classifySpotToken({ symbol: t.symbol, address: t.id, chain: t.chain })
-      addUsd(usdByBand, band, usd)
-    }
+  // Merge band USD values
+  const rawBands: Record<string, number> = {};
+  for (const [band, usd] of Object.entries(ethBands)) {
+    rawBands[band] = (rawBands[band] ?? 0) + usd;
+  }
+  for (const [band, usd] of Object.entries(solBands)) {
+    rawBands[band] = (rawBands[band] ?? 0) + usd;
+  }
+  rawBands['R8'] = (rawBands['R8'] ?? 0) + r8Usd;
+
+  // Total portfolio value (all bands incl. R0)
+  const total = Object.values(rawBands).reduce((a, b) => a + b, 0);
+  const r0Usd = rawBands['R0'] ?? 0;
+
+  if (total < 0.01) warnings.push('Total portfolio value near zero — wallet may be empty');
+
+  // Convert to percentages (R1–R8 as radar axes; R0 in meta)
+  const pctBands: Record<string, number> = {};
+  for (const [band, usd] of Object.entries(rawBands)) {
+    pctBands[band] = total > 0 ? (usd / total) * 100 : 0;
   }
 
-  // 2) DeBank protocol positions
-  {
-    const prots = await fetchDebankProtocols(G_EVM_WALLET)
-    sourceStatus.debankProtocols = { ok: prots.length > 0, detail: prots.length ? `protocols=${prots.length}` : 'empty' }
+  // Build 7d deltas from previous snapshot
+  const snapshot = { ...pctBands };
+  const computeDelta = (key: string): number | undefined => {
+    if (!prevSnapshot) return undefined;
+    return (pctBands[key] ?? 0) - (prevSnapshot[key] ?? 0);
+  };
+  const flowDir = (key: string): FlowDirection => {
+    const d = computeDelta(key);
+    if (d == null) return 'neutral';
+    if (d > 0.5)  return 'inflow';
+    if (d < -0.5) return 'outflow';
+    return 'neutral';
+  };
 
-    for (const p of prots) {
-      const items = p.portfolio_item_list ?? []
-      for (const it of items) {
-        const usd = num(it.stats?.net_usd_value)
+  // Build R1–R8 band array
+  const radarKeys = ['R1','R2','R3','R4','R5','R6','R7','R8'];
+  const bands: RiskBandPoint[] = radarKeys.map((key) => {
+    const meta = BAND_META[key]!;
+    const valueNow  = pctBands[key] ?? 0;
+    const delta7d   = computeDelta(key);
+    const prev7d    = prevSnapshot ? (prevSnapshot[key] ?? 0) : undefined;
+    return {
+      key,
+      label: meta.label,
+      name:  meta.name,
+      valueNow: Math.round(valueNow * 10) / 10,
+      value7dAgo: prev7d != null ? Math.round(prev7d * 10) / 10 : undefined,
+      delta7d: delta7d != null ? Math.round(delta7d * 10) / 10 : undefined,
+      flowDirection: flowDir(key),
+    };
+  });
 
-        // best-effort extract of underlying symbols if present
-        const und: string[] = []
-        try {
-          const detail = it.detail as any
-          const maybeTokens: any[] =
-            detail?.supply_token_list ?? detail?.token_list ?? detail?.underlying_token_list ?? []
-          if (Array.isArray(maybeTokens)) {
-            for (const ut of maybeTokens) {
-              if (ut?.symbol && typeof ut.symbol === 'string') und.push(ut.symbol)
-            }
-          }
-        } catch {
-          // ignore
-        }
-
-        const band = classifyProtocolPosition({
-          protocolName: p.name,
-          positionName: it.name,
-          category: (it.detail as any)?.type ?? (it.detail as any)?.category ?? null,
-          underlyingSymbols: und
-        })
-
-        addUsd(usdByBand, band, usd)
-      }
-    }
-  }
-
-  // 3) Helius Solana fungible tokens
-  {
-    const helius = await fetchHeliusAssets(G_SOL_WALLET)
-    const items = helius?.result?.items ?? []
-    const fung = items.filter((i) => i.interface === 'FungibleToken')
-    sourceStatus.helius = { ok: fung.length > 0, detail: fung.length ? `fungible=${fung.length}` : 'empty' }
-
-    for (const f of fung) {
-      const sym = f.token_info?.symbol ?? f.content?.metadata?.symbol
-      const usd = num(f.token_info?.price_info?.total_price)
-      const band = classifySpotToken({ symbol: sym, address: f.id ?? null, chain: 'solana' })
-      addUsd(usdByBand, band, usd)
-    }
-  }
-
-  // 4) Hyperliquid
-  {
-    const st = await fetchHyperliquidState(G_EVM_WALLET)
-    const accountValueUsd = num(st?.marginSummary?.accountValue)
-    sourceStatus.hyperliquid = {
-      ok: st != null,
-      detail: st ? `accountValue=${accountValueUsd}` : 'null'
-    }
-    addUsd(usdByBand, 'R8', accountValueUsd)
-  }
-
-  const totalUsd = Object.values(usdByBand).reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0)
-
-  const pctByBand = initBandMap()
-  if (totalUsd > 0) {
-    for (const k of Object.keys(pctByBand) as PRiskBandKey[]) {
-      pctByBand[k] = (usdByBand[k] / totalUsd) * 100
-    }
-  }
-
-  // 7d delta: compare to last seen snapshot in-memory.
-  const mem = getPmodeMemory()
-  const prevPct = mem.lastPct
-  mem.lastPct = pctByBand
-  mem.lastAsOf = nowIso()
+  prevSnapshot = snapshot;
 
   const payload: MacroOracleRadarPayload = {
-    asOf: nowIso(),
+    asOf: new Date().toISOString(),
     mode: 'p',
-    bands: bandsToPoints({ pctByBand, prevPctByBand: prevPct }),
+    bands,
     meta: {
-      wallets: {
-        evm: G_EVM_WALLET,
-        sol: G_SOL_WALLET
-      },
-      usdByBand,
-      totalUsd,
-      dryPowder: {
-        usd: usdByBand.R0,
-        pctOfTotal: totalUsd > 0 ? (usdByBand.R0 / totalUsd) * 100 : 0
-      },
-      sources: sourceStatus,
-      cache: {
-        hit: cached.hit,
-        stale: cached.stale,
-        ttlSeconds: TTL_SECONDS
-      }
-    }
-  }
+      source: 'live',
+      r0DryPowderUsd: Math.round(r0Usd * 100) / 100,
+      r0DryPowderPct: total > 0 ? Math.round((r0Usd / total) * 1000) / 10 : 0,
+      totalPortfolioUsd: Math.round(total * 100) / 100,
+      warnings: warnings.length ? warnings : undefined,
+    },
+  };
 
-  // store cache (even if zeros)
-  await cacheSet(key, payload, TTL_SECONDS)
-  return payload
+  cache = { data: payload, fetchedAt: now };
+  return payload;
 }
