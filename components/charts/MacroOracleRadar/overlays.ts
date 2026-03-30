@@ -1,4 +1,4 @@
-import type { MacroOracleRadarPayload, RiskBandPoint } from './types';
+import type { MacroOracleRadarPayload, RiskBandPoint, MacroOracleMode, FlowDirection } from './types';
 import {
   axisAngleDeg,
   clamp,
@@ -23,7 +23,7 @@ const WARM_TAIL = '#E4572E';
 const INFLOW_HEX = '#1FE091';
 const OUTFLOW_HEX = '#FF5E5B';
 const NEUTRAL_HEX = '#6F738A';
-const FLOW_REF_DELTA = 15; // normalized delta (~15 pts) treated as "strong"
+const FLOW_REF_DELTA = 15;
 
 function hexToRgb(hex: string): { r: number; g: number; b: number } {
   const h = hex.replace('#', '').trim();
@@ -41,7 +41,18 @@ export function flowAlpha(magnitude01: number): number {
   return lerp(0.08, 0.42, clamp(magnitude01, 0, 1));
 }
 
-function wedgeFill(delta: number | null | undefined): string {
+function wedgeFill(
+  delta: number | null | undefined,
+  flowDirection?: FlowDirection,
+  mode?: MacroOracleMode
+): string {
+  // G-mode: use explicit flowDirection for strong, clear fills
+  if (mode === 'g' && flowDirection != null) {
+    if (flowDirection === 'inflow')  return rgba(INFLOW_HEX,  0.38);
+    if (flowDirection === 'outflow') return rgba(OUTFLOW_HEX, 0.33);
+    return rgba(NEUTRAL_HEX, 0.15);
+  }
+  // P-mode (or no flowDirection): delta-based subtle fill
   if (delta == null || !Number.isFinite(delta)) {
     return rgba(NEUTRAL_HEX, 0.12);
   }
@@ -99,11 +110,11 @@ export function getPrevValue7d(band: RiskBandPoint, payload: MacroOracleRadarPay
 }
 
 export type BuildOverlaysArgs = {
-  // ECharts module, needed for graphic.LinearGradient.
   echarts: any;
   payload: MacroOracleRadarPayload;
   geom: RadarGeometry;
   theme: 'dark' | 'light';
+  mode?: MacroOracleMode;
 };
 
 function wedgePolygonPoints(i: number, geom: RadarGeometry): Point[] {
@@ -144,7 +155,7 @@ function deltaForBand(band: RiskBandPoint, payload: MacroOracleRadarPayload): nu
 }
 
 export function buildGraphicOverlays(args: BuildOverlaysArgs): any[] {
-  const { echarts, payload, geom, theme } = args;
+  const { echarts, payload, geom, theme, mode } = args;
   const isDark = theme === 'dark';
 
   const elements: any[] = [];
@@ -152,7 +163,7 @@ export function buildGraphicOverlays(args: BuildOverlaysArgs): any[] {
   // 1) Flow-sensitive heat wedges (back layer)
   payload.bands.forEach((b, i) => {
     const delta = deltaForBand(b, payload);
-    const fill = wedgeFill(delta);
+    const fill = wedgeFill(delta, b.flowDirection, mode);
     elements.push({
       id: `wedge-${b.key}`,
       type: 'polygon',
@@ -177,7 +188,6 @@ export function buildGraphicOverlays(args: BuildOverlaysArgs): any[] {
     const p0 = pointForValue(i, prev, geom);
     const p1 = pointForValue(i, vNow, geom);
 
-    // If effectively unchanged, omit to reduce noise.
     if (Math.hypot(p1.x - p0.x, p1.y - p0.y) < 1.0) return;
 
     const col = tailColor(enc.direction);
