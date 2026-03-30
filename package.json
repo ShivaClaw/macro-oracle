@@ -20,6 +20,7 @@
     "cron:worker": "tsx cron/runner.ts worker:drain"
   },
   "dependencies": {
+    "@walletconnect/modal": "^2.7.0",
     "echarts": "^5.5.1",
     "echarts-for-react": "^3.0.2",
     "next": "14.2.5",
